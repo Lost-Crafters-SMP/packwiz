@@ -21,8 +21,9 @@ func PromptYesNo(prompt string) bool {
 	}
 
 	ansNormal := strings.ToLower(strings.TrimSpace(answer))
-	if len(ansNormal) > 0 && ansNormal[0] == 'n' {
-		return false
+	// Only accept "y" or "yes" (case-insensitive), reject everything else
+	if ansNormal == "y" || ansNormal == "yes" {
+		return true
 	}
-	return true
+	return false
 }

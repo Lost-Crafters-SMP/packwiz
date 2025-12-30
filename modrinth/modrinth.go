@@ -32,16 +32,29 @@ func init() {
 	mrDefaultClient.UserAgent = core.UserAgent
 }
 
-func getProjectIdsViaSearch(query string, versions []string) ([]*modrinthApi.SearchResult, error) {
-	facets := make([]string, 0)
+func getProjectIdsViaSearch(query string, versions []string, projectType string) ([]*modrinthApi.SearchResult, error) {
+	facets := make([][]string, 0)
+
+	// Modrinth facets format: inner arrays are OR'd, outer arrays are AND'd
+	// Use game_versions (not versions) as per API
+	versionFacets := make([]string, 0)
 	for _, v := range versions {
-		facets = append(facets, "versions:"+v)
+		versionFacets = append(versionFacets, "game_versions:"+v)
+	}
+	facets = append(facets, versionFacets)
+
+	// Filter by project_type if specified (plugin vs mod)
+	// Note: Modrinth search API doesn't support filtering by loaders directly,
+	// but we can filter by project_type to show only plugins or only mods
+	if projectType != "" {
+		typeFacets := []string{"project_types:" + projectType}
+		facets = append(facets, typeFacets)
 	}
 
 	res, err := mrDefaultClient.Projects.Search(&modrinthApi.SearchOptions{
 		Limit:  5,
 		Index:  "relevance",
-		Facets: [][]string{facets},
+		Facets: facets,
 		Query:  query,
 	})
 
@@ -59,6 +72,18 @@ var defaultMRLoaders = []string{
 	"optifine",
 	"vanilla",   // Core shaders
 	"minecraft", // Resource packs
+}
+
+// Plugin loaders that can be configured in pack.toml
+var pluginMRLoaders = []string{
+	"bukkit",
+	"spigot",
+	"paper",
+	"purpur",
+	"sponge",
+	"bungeecord",
+	"waterfall",
+	"velocity",
 }
 
 var withDatapackPathMRLoaders = []string{
@@ -156,6 +181,28 @@ func getProjectTypeFolder(projectType string, fileLoaders []string, packLoaders 
 		}
 		return "shaderpacks", nil
 	} else if projectType == "mod" {
+		// Check if any of the file loaders are plugin loaders - if so, treat as plugin
+		// This handles cases where Modrinth misclassifies plugins as mods
+		for _, loader := range fileLoaders {
+			if slices.Contains(pluginMRLoaders, loader) {
+				// This is actually a plugin, use plugin folder logic
+				bestLoaderIdx := math.MaxInt
+				for _, v := range fileLoaders {
+					idx := slices.Index(loaderPreferenceList, v)
+					if idx != -1 && idx < bestLoaderIdx {
+						bestLoaderIdx = idx
+					}
+				}
+				if bestLoaderIdx > -1 && bestLoaderIdx < math.MaxInt {
+					// Verify it's actually a plugin loader
+					if folder, ok := loaderFolders[loaderPreferenceList[bestLoaderIdx]]; ok && folder == "plugins" {
+						return "plugins", nil
+					}
+				}
+				return "plugins", nil
+			}
+		}
+
 		// Look up pack loaders in the list of loaders (note this is currently filtered to quilt/fabric/neoforge/forge)
 		bestLoaderIdx := math.MaxInt
 		for _, v := range fileLoaders {
@@ -180,9 +227,64 @@ func getProjectTypeFolder(projectType string, fileLoaders []string, packLoaders 
 		}
 		// Default to "mods" for mod type
 		return "mods", nil
+	} else if projectType == "plugin" {
+		// Plugin projects should always go to plugins folder
+		// Use the best matching loader from fileLoaders for preference ordering
+		bestLoaderIdx := math.MaxInt
+		for _, v := range fileLoaders {
+			idx := slices.Index(loaderPreferenceList, v)
+			if idx != -1 && idx < bestLoaderIdx {
+				bestLoaderIdx = idx
+			}
+		}
+		// All plugin loaders map to "plugins" folder, but we use preference for version selection
+		if bestLoaderIdx > -1 && bestLoaderIdx < math.MaxInt {
+			// Verify it's actually a plugin loader
+			if folder, ok := loaderFolders[loaderPreferenceList[bestLoaderIdx]]; ok && folder == "plugins" {
+				return "plugins", nil
+			}
+		}
+		return "plugins", nil
 	} else {
 		return "", fmt.Errorf("unknown project type %s", projectType)
 	}
+}
+
+// getCompatiblePluginLoaders extracts plugin loaders from pack.Versions
+// It enforces that plugin loaders and mod loaders cannot be configured together
+func getCompatiblePluginLoaders(pack core.Pack) ([]string, error) {
+	// First check: enforce incompatibility with mod loaders
+	modLoaders := pack.GetCompatibleLoaders()
+	if len(modLoaders) > 0 {
+		return nil, errors.New("plugin loaders and mod loaders cannot be configured together in pack.toml. Remove one or the other.")
+	}
+
+	// Extract plugin loaders from pack.Versions
+	var pluginLoaders []string
+	for _, loaderName := range pluginMRLoaders {
+		if _, hasLoader := pack.Versions[loaderName]; hasLoader {
+			pluginLoaders = append(pluginLoaders, loaderName)
+		}
+	}
+
+	// Apply compat groups: if a fork loader is configured, also include the parent loader
+	// This is useful because fork plugins (e.g., Paper) are compatible with parent (Bukkit)
+	// The loaderCompatGroups map has parent as key and forks as values, so we need to reverse lookup
+	var additionalLoaders []string
+	for _, loader := range pluginLoaders {
+		// Check if this loader is a fork (in any compat group values)
+		for parent, forks := range loaderCompatGroups {
+			if slices.Contains(forks, loader) {
+				// This loader is a fork, add its parent if not already in list
+				if !slices.Contains(pluginLoaders, parent) && !slices.Contains(additionalLoaders, parent) {
+					additionalLoaders = append(additionalLoaders, parent)
+				}
+			}
+		}
+	}
+	pluginLoaders = append(pluginLoaders, additionalLoaders...)
+
+	return pluginLoaders, nil
 }
 
 var urlRegexes = [...]*regexp.Regexp{
@@ -312,11 +414,35 @@ func getLatestVersion(projectID string, name string, pack core.Pack) (*modrinthA
 	if err != nil {
 		return nil, err
 	}
+
+	// Fetch project to determine its type
+	project, err := mrDefaultClient.Projects.Get(projectID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch project: %w", err)
+	}
+
 	var loaders []string
-	if viper.GetString("datapack-folder") != "" {
-		loaders = append(pack.GetCompatibleLoaders(), withDatapackPathMRLoaders...)
+	projectTypeStr := ""
+	if project.ProjectType != nil {
+		projectTypeStr = *project.ProjectType
+	}
+	if projectTypeStr == "plugin" {
+		// For plugin projects, use plugin loaders
+		pluginLoaders, err := getCompatiblePluginLoaders(pack)
+		if err != nil {
+			return nil, err
+		}
+		if len(pluginLoaders) == 0 {
+			return nil, errors.New("no plugin platforms configured in pack.toml. Add plugin platform(s) to versions section (e.g., versions = { paper = \"1.20.1-205\" })")
+		}
+		loaders = pluginLoaders
 	} else {
-		loaders = append(pack.GetCompatibleLoaders(), defaultMRLoaders...)
+		// For mod projects (and other types), use mod loaders
+		if viper.GetString("datapack-folder") != "" {
+			loaders = append(pack.GetCompatibleLoaders(), withDatapackPathMRLoaders...)
+		} else {
+			loaders = append(pack.GetCompatibleLoaders(), defaultMRLoaders...)
+		}
 	}
 
 	result, err := mrDefaultClient.Versions.ListVersions(projectID, modrinthApi.ListVersionsOptions{
@@ -327,8 +453,58 @@ func getLatestVersion(projectID string, name string, pack core.Pack) (*modrinthA
 		return nil, fmt.Errorf("failed to fetch latest version: %w", err)
 	}
 	if len(result) == 0 {
-		// TODO: retry with datapack specified, to determine what the issue is? or just request all and filter afterwards
-		return nil, errors.New("no valid versions found\n\tUse the 'packwiz settings acceptable-versions' command to accept more game versions\n\tTo use datapacks, add a datapack loader mod and specify the datapack-folder option with the folder this mod loads datapacks from")
+		// Special case: if project is classified as "mod" but pack has plugin loaders configured,
+		// try querying with plugin loaders as well (some plugins are misclassified on Modrinth)
+		if projectTypeStr == "mod" {
+			pluginLoaders, err := getCompatiblePluginLoaders(pack)
+			// Ignore incompatibility error - we're just checking if plugin loaders exist
+			if err == nil && len(pluginLoaders) > 0 {
+				pluginResult, err := mrDefaultClient.Versions.ListVersions(projectID, modrinthApi.ListVersionsOptions{
+					GameVersions: gameVersions,
+					Loaders:      pluginLoaders,
+				})
+				if err == nil && len(pluginResult) > 0 {
+					// Found versions with plugin loaders - use those instead
+					result = pluginResult
+					loaders = pluginLoaders
+					projectTypeStr = "plugin" // Treat as plugin for error messages
+				}
+			}
+		}
+	}
+	if len(result) == 0 {
+		// Try querying without loaders to see if there are versions for this Minecraft version
+		// This helps debug if the issue is loader filtering or version filtering
+		allVersionsResult, err := mrDefaultClient.Versions.ListVersions(projectID, modrinthApi.ListVersionsOptions{
+			GameVersions: gameVersions,
+		})
+		var errorMsg string
+		isPlugin := projectTypeStr == "plugin"
+
+		if err == nil && len(allVersionsResult) > 0 {
+			// There are versions for this Minecraft version, but not for the specified loaders
+			if isPlugin {
+				errorMsg = fmt.Sprintf("no valid versions found for %s (project type: %s)\n\tConfigured plugin platforms: %v\n\tConfigured Minecraft version: %v\n\tThis plugin has versions for this Minecraft version but not for the configured plugin platform(s)", name, projectTypeStr, loaders, gameVersions)
+				errorMsg += "\n\tTry checking what plugin platforms this plugin supports on Modrinth"
+			} else {
+				errorMsg = fmt.Sprintf("no valid versions found for %s (project type: %s)\n\tConfigured loaders: %v\n\tConfigured Minecraft version: %v\n\tUse the 'packwiz settings acceptable-versions' command to accept more game versions", name, projectTypeStr, loaders, gameVersions)
+				if !isPlugin {
+					errorMsg += "\n\tTo use datapacks, add a datapack loader mod and specify the datapack-folder option with the folder this mod loads datapacks from"
+				}
+			}
+		} else {
+			// No versions for this Minecraft version either
+			if isPlugin {
+				errorMsg = fmt.Sprintf("no valid versions found for %s (project type: %s)\n\tConfigured plugin platforms: %v\n\tConfigured Minecraft version: %v\n\tThis plugin may not support the configured plugin platform(s) or Minecraft version", name, projectTypeStr, loaders, gameVersions)
+				errorMsg += "\n\tUse the 'packwiz settings acceptable-versions' command to accept more game versions"
+			} else {
+				errorMsg = fmt.Sprintf("no valid versions found for %s (project type: %s)\n\tConfigured loaders: %v\n\tConfigured Minecraft version: %v\n\tUse the 'packwiz settings acceptable-versions' command to accept more game versions", name, projectTypeStr, loaders, gameVersions)
+				if !isPlugin {
+					errorMsg += "\n\tTo use datapacks, add a datapack loader mod and specify the datapack-folder option with the folder this mod loads datapacks from"
+				}
+			}
+		}
+		return nil, errors.New(errorMsg)
 	}
 
 	// TODO: option to always compare using flexver?

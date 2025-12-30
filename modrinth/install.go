@@ -148,11 +148,80 @@ func installViaSearch(query string, versionFilename string, autoAcceptFirst bool
 		return err
 	}
 
+	// Determine which project type to filter by
+	// Note: Modrinth search API doesn't support filtering by loaders directly,
+	// but we can filter by project_type to show only plugins or only mods
+	var searchProjectType string
+	modLoaders := pack.GetCompatibleLoaders()
+	if len(modLoaders) > 0 {
+		// Pack has mod loaders - search for mods only
+		searchProjectType = "mod"
+	} else {
+		// Check if pack has plugin loaders
+		pluginLoaders, err := getCompatiblePluginLoaders(pack)
+		if err == nil && len(pluginLoaders) > 0 {
+			// Pack has plugin loaders - search for plugins only
+			searchProjectType = "plugin"
+		}
+		// If neither, searchProjectType stays empty (no type filtering)
+	}
+
 	fmt.Println("Searching Modrinth...")
 
-	results, err := getProjectIdsViaSearch(query, mcVersions)
+	// Always search without API filter first, then post-filter
+	// This is more reliable since the API filter can be inconsistent
+	results, err := getProjectIdsViaSearch(query, mcVersions, "")
 	if err != nil {
 		return err
+	}
+
+	// If we have a project type to filter by, do post-filtering
+	if searchProjectType != "" && len(results) > 0 {
+		// API filter returned results - trust it but do a quick verification
+		// Only filter out obvious mismatches to avoid being too strict
+		projectIDs := make([]string, 0, len(results))
+		for _, result := range results {
+			if result.ProjectID != nil {
+				projectIDs = append(projectIDs, *result.ProjectID)
+			}
+		}
+
+		if len(projectIDs) > 0 {
+			projects, err := mrDefaultClient.Projects.GetMultiple(projectIDs)
+			if err == nil {
+				// Build a set of project IDs that match the expected type
+				projectIDSet := make(map[string]bool)
+				hasMismatches := false
+				for _, project := range projects {
+					if project.ID != nil && project.ProjectType != nil {
+						if *project.ProjectType == searchProjectType {
+							projectIDSet[*project.ID] = true
+						} else {
+							hasMismatches = true
+						}
+					}
+				}
+
+				// Only filter if we found mismatches - otherwise trust the API filter
+				if hasMismatches {
+					filteredResults := make([]*modrinthApi.SearchResult, 0)
+					for _, result := range results {
+						if result.ProjectID != nil {
+							if projectIDSet[*result.ProjectID] {
+								filteredResults = append(filteredResults, result)
+							}
+						}
+					}
+					// Only update if we still have results after filtering
+					if len(filteredResults) > 0 {
+						results = filteredResults
+					}
+					// If filteredResults is empty but hasMismatches is true,
+					// it means all results were wrong type - keep original to let user see them
+				}
+			}
+			// If GetMultiple fails, trust the API filter and show results as-is
+		}
 	}
 
 	if len(results) == 0 {

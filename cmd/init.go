@@ -16,6 +16,18 @@ import (
 	"github.com/spf13/viper"
 )
 
+// Plugin loaders supported by Modrinth
+var pluginLoaders = []string{
+	"bukkit",
+	"spigot",
+	"paper",
+	"purpur",
+	"sponge",
+	"bungeecord",
+	"waterfall",
+	"velocity",
+}
+
 // initCmd represents the init command
 var initCmd = &cobra.Command{
 	Use:   "init",
@@ -82,7 +94,7 @@ var initCmd = &cobra.Command{
 
 		modLoaderName := strings.ToLower(viper.GetString("init.modloader"))
 		if len(modLoaderName) == 0 {
-			modLoaderName = strings.ToLower(initReadValue("Mod loader [quilt]: ", "quilt"))
+			modLoaderName = strings.ToLower(initReadValue("Loader (mod or plugin) [quilt]: ", "quilt"))
 		}
 
 		loader, ok := core.ModLoaders[modLoaderName]
@@ -114,16 +126,34 @@ var initCmd = &cobra.Command{
 				}
 				modLoaderVersions[loader.Name] = v
 			} else {
-				fmt.Println("Given mod loader is not supported! Use \"none\" to specify no modloader, or to configure one manually.")
-				fmt.Print("The following mod loaders are supported: ")
-				keys := make([]string, len(core.ModLoaders))
-				i := 0
-				for k := range core.ModLoaders {
-					keys[i] = k
-					i++
+				// Check if it's a plugin loader
+				if slices.Contains(pluginLoaders, modLoaderName) {
+					// Plugin loaders need version to be specified manually
+					pluginVersion := viper.GetString("init." + modLoaderName + "-version")
+					if len(pluginVersion) == 0 {
+						// Capitalize first letter for display
+						displayName := strings.ToUpper(string(modLoaderName[0])) + modLoaderName[1:]
+						pluginVersion = initReadValue(displayName+" version: ", "")
+						if len(pluginVersion) == 0 {
+							fmt.Println("Plugin loader version is required!")
+							os.Exit(1)
+						}
+					}
+					modLoaderVersions[modLoaderName] = pluginVersion
+				} else {
+					fmt.Println("Given loader is not supported! Use \"none\" to specify no loader, or to configure one manually.")
+					fmt.Print("The following mod loaders are supported: ")
+					modLoaderKeys := make([]string, len(core.ModLoaders))
+					i := 0
+					for k := range core.ModLoaders {
+						modLoaderKeys[i] = k
+						i++
+					}
+					fmt.Println(strings.Join(modLoaderKeys, ", "))
+					fmt.Print("The following plugin loaders are supported: ")
+					fmt.Println(strings.Join(pluginLoaders, ", "))
+					os.Exit(1)
 				}
-				fmt.Println(strings.Join(keys, ", "))
-				os.Exit(1)
 			}
 		}
 
